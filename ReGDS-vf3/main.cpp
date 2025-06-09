@@ -1,15 +1,17 @@
-#define VF3L
-#include <chrono>
 #ifndef STRESS_TEST_COUNT
 #define STRESS_TEST_COUNT 1000
 #endif
+#define VF3L
+
+#include <chrono>
 #include <fstream>
 #include <thread>
 #include <vector>
 #include <atomic>
 #include <fmt/core.h>
-#include <numeric>          // for std::iota
-#include <algorithm>        // for std::find, std::sort
+#include <numeric>
+#include <algorithm>
+#include <boost/range/iterator_range.hpp>
 
 // vf3lib
 #include <ARGEdit.hpp>
@@ -26,66 +28,89 @@
 #include "Graph.hpp"
 #include "bgl_vf2pp.hpp"
 #include "opt_vf2pp.hpp"
-#include <boost/range/iterator_range.hpp>
 
 using namespace vflib;
 using namespace spice;
 
+// global
 spice::SubCktDefinitionMap subckt_definition_map;
 
-// map vertex_name → gate‐class
-int normalize_gate_type(int type) {
-    switch (type) {
-        case 0: return 0; // input pins
-        case 1: return 1; // NAND2
-        case 2: return 2; // NOR2
-        case 3: return 3; // INV
-        default: return -1;
+// normalize raw BGL vertex_name → matching label
+int normalize_gate_type(int raw) {
+    switch (raw) {
+      case 0: return 0;   // input pins
+      case 1: return 1;   // NAND2
+      case 2: return 2;   // NOR2
+      case 3: return 3;   // INV
+      default: return -1;
     }
 }
 
-// minimal adjacency+label graph for VF3
+// adjacency + normalized labels
 struct SimpleGraph {
-    int n;
+    int n;                                   // # of FETs only
     std::vector<std::vector<int>> adj;
     std::vector<int>              label;
 
-    SimpleGraph(const bgl_graph& B) {
+    SimpleGraph(const bgl_graph& B, bool logLabels = false) {
         using namespace boost;
-        auto idx       = get(vertex_index, B);
-        auto gate_type = get(vertex_name,  B);
+        auto idx = get(vertex_index, B);
+        auto vt  = get(vertex_name,  B);
 
-        n     = num_vertices(B);
-        adj   .assign(n,{});
-        label .assign(n, 0);
+        // 1) First pass: build a map from old‐indices → new‐indices,
+        //    but *only* for raw > 0 (i.e. transistor nodes).
+        int nextId = 0;
+        std::vector<int> old2new(num_vertices(B), -1);
+        for (auto v : make_iterator_range(vertices(B))) {
+            int raw = vt[v];
+            if (raw > 0) {
+                old2new[idx[v]] = nextId++;
+            }
+        }
+        n = nextId;
+        adj .assign(n,{});
+        label.assign(n,0);
 
-        // labels
-        for (auto v : make_iterator_range(vertices(B)))
-            label[idx[v]] = normalize_gate_type(gate_type[v]);
+        // 2) Second pass: fill in label[] and adjacency among those new ids
+        for (auto v : make_iterator_range(vertices(B))) {
+            int o = idx[v];
+            int ni = old2new[o];
+            if (ni < 0) continue;               // skip nets (raw == 0)
 
-        // edges
-        for (auto e : make_iterator_range(edges(B))) {
-            int u = idx[source(e,B)], v = idx[target(e,B)];
-            adj[u].push_back(v);
-            adj[v].push_back(u);
+            int raw = vt[v];
+            int norm = normalize_gate_type(raw);
+            label[ni] = norm;
+            if (logLabels) {
+                fmt::println("  [FET {:>2}] raw={:<2} norm={}", ni, raw, norm);
+            }
+
+            // now walk its edges, but only connect to other FETs
+            for (auto e : make_iterator_range(out_edges(v, B))) {
+                int w_old = idx[target(e,B)];
+                int w_new = old2new[w_old];
+                if (w_new >= 0) {
+                    adj[ni].push_back(w_new);
+                }
+            }
         }
     }
 };
 
+
+// backtracking state for VF-3
 struct CustomVF3State {
     const SimpleGraph &P, &T;
     std::vector<int> coreP, coreT, order;
     int depth = 0;
 
-    CustomVF3State(const SimpleGraph &P_, const SimpleGraph &T_)
+    CustomVF3State(const SimpleGraph& P_, const SimpleGraph& T_)
       : P(P_), T(T_), coreP(P_.n, -1), coreT(T_.n, -1), order(P_.n)
     { std::iota(order.begin(), order.end(), 0); }
 
     bool goal() const { return depth == P.n; }
 
-    bool feasible(int u, int v) {
-        if (T.label[v] < 0) return false;
-        if (P.label[u] != T.label[v]) return false;
+    bool feasible(int u, int v) const {
+        if (T.label[v] < 0 || P.label[u] != T.label[v]) return false;
         for (int u2 : P.adj[u]) {
             int v2 = coreP[u2];
             if (v2 >= 0) {
@@ -102,7 +127,7 @@ struct CustomVF3State {
         int u = order[depth++];
         for (int v = 0; v < T.n; ++v) {
             if (coreT[v] >= 0) continue;
-            if (!feasible(u,v)) continue;
+            if (!feasible(u, v)) continue;
             coreP[u] = v; coreT[v] = u;
             if (match()) return true;
             coreP[u] = coreT[v] = -1;
@@ -113,11 +138,40 @@ struct CustomVF3State {
 };
 
 void optimized_vf3_hrgen(Netlist& lib, Netlist& src) {
-    // build src/lib graphs once
-    std::vector<SimpleGraph> SG_src, SG_lib;
-    for (auto &c : src.component_list) SG_src.emplace_back(*c.bgl_cgraph);
-    for (auto &c : lib.component_list) SG_lib.emplace_back(*c.bgl_cgraph);
+    // 1) Build & log source graphs
+    fmt::println("=== Source graphs ===");
+    std::vector<SimpleGraph> SG_src;
+    for (auto &c : src.component_list) {
+        fmt::println("Component “{}”:", c.name);
+        SG_src.emplace_back(*c.bgl_cgraph, /*logLabels=*/true);
+    }
 
+    // 2) Build & log library graphs
+    fmt::println("\n=== Library graphs & sizes ===");
+    std::vector<SimpleGraph> SG_lib;
+    for (auto &c : lib.component_list) {
+        SG_lib.emplace_back(*c.bgl_cgraph, /*logLabels=*/true);
+    }
+    for (size_t j = 0; j < SG_lib.size(); ++j) {
+        fmt::println("Pattern “{}” has {} vertices",
+                     lib.component_list[j].name,
+                     SG_lib[j].n);
+    }
+
+    // 3) Split into big (>1) and small (==1)
+    struct LibEntry { SimpleGraph *G; SubCkt* C; size_t sz; };
+    std::vector<LibEntry> big, small;
+    for (size_t j = 0; j < SG_lib.size(); ++j) {
+        size_t sz = SG_lib[j].n;
+        if (sz > 1) big.push_back({&SG_lib[j], &lib.component_list[j], sz});
+        else        small.push_back({&SG_lib[j], &lib.component_list[j], sz});
+    }
+
+    // 4) Sort big *descending* so largest patterns win first
+    std::sort(big.begin(), big.end(),
+              [&](auto &a, auto &b){ return a.sz > b.sz; });
+
+    // 5) Multithreaded matching
     auto t0 = std::chrono::high_resolution_clock::now();
     std::atomic<size_t> idx{0};
     size_t NT = std::thread::hardware_concurrency();
@@ -127,55 +181,64 @@ void optimized_vf3_hrgen(Netlist& lib, Netlist& src) {
         thr.emplace_back([&](){
             size_t i;
             while ((i = idx++) < SG_src.size()) {
-                auto &Tg    = SG_src[i];
+                // work on a fresh copy
+                SimpleGraph Tg = SG_src[i];
                 auto &compT = src.component_list[i];
-                bool progress = true;
-                auto start = std::chrono::high_resolution_clock::now();
 
+                // PHASE 1: big patterns
+                bool progress = true;
                 while (progress) {
                     progress = false;
-                    // timeout 10s per component
-                    if (std::chrono::duration<double>(
-                        std::chrono::high_resolution_clock::now() - start
-                    ).count() > 10.0) {
-                        fmt::println("Timeout on {}", compT.name);
-                        break;
-                    }
-
-                    for (size_t j = 0; j < SG_lib.size(); ++j) {
-                        auto &Pg    = SG_lib[j];
-                        auto &compP = lib.component_list[j];
-
-                        CustomVF3State st(Pg, Tg);
+                    for (auto &ent : big) {
+                        CustomVF3State st(*ent.G, Tg);
                         if (!st.match()) continue;
-
-                        fmt::println("Matched “{}” → “{}”", compP.name, compT.name);
+                        fmt::println("Matched BIG “{}” → {}", ent.C->name, compT.name);
                         progress = true;
 
-                        auto inst = compP.make_instance(compT, subckt_definition_map);
-                        // **SWAPPED** u=lib‐index, v=src‐index
-                        for (int u = 0; u < Pg.n; ++u) {
+                        auto inst = ent.C->make_instance(compT, subckt_definition_map);
+                        for (int u = 0; u < ent.G->n; ++u) {
                             int v = st.coreP[u];
                             if (v >= 0)
-                                compT.map_mosfet(u, v, compP, inst);
+                                compT.map_mosfet(u, v, *ent.C, inst);
                         }
                         compT.add_subckt_instance(inst);
 
-                        // remove matched nodes from Tg
-                        for (int u = 0; u < Pg.n; ++u) {
+                        // remove matched vertices
+                        for (int u = 0; u < ent.G->n; ++u) {
                             int v = st.coreP[u];
                             if (v < 0) continue;
                             Tg.label[v] = -1;
                             for (int w : Tg.adj[v]) {
                                 auto &nbr = Tg.adj[w];
-                                nbr.erase(std::remove(nbr.begin(),nbr.end(),v),
-                                          nbr.end());
+                                nbr.erase(std::remove(nbr.begin(), nbr.end(), v), nbr.end());
                             }
                             Tg.adj[v].clear();
                         }
-
-                        break;  // restart matching on this Tg
+                        break;  // restart big loop
                     }
+                }
+
+                // PHASE 2: small patterns
+                for (auto &ent : small) {
+                    bool did;
+                    do {
+                        CustomVF3State st(*ent.G, Tg);
+                        if (!st.match()) break;
+                        fmt::println("Matched SMALL “{}” → {}", ent.C->name, compT.name);
+
+                        auto inst = ent.C->make_instance(compT, subckt_definition_map);
+                        int v = st.coreP[0];
+                        compT.map_mosfet(0, v, *ent.C, inst);
+                        compT.add_subckt_instance(inst);
+
+                        Tg.label[v] = -1;
+                        for (int w : Tg.adj[v]) {
+                            auto &nbr = Tg.adj[w];
+                            nbr.erase(std::remove(nbr.begin(), nbr.end(), v), nbr.end());
+                        }
+                        Tg.adj[v].clear();
+                        did = true;
+                    } while (did);
                 }
             }
         });
@@ -183,36 +246,30 @@ void optimized_vf3_hrgen(Netlist& lib, Netlist& src) {
     for (auto &th : thr) th.join();
 
     auto t1 = std::chrono::high_resolution_clock::now();
-    fmt::println("VF3 time: {:.3f} ms",
-                 std::chrono::duration<double,std::milli>(t1 - t0).count());
+    fmt::println("VF3 matching time: {:.3f} ms",
+        std::chrono::duration<double,std::milli>(t1 - t0).count());
 
-    // final Verilog out
+    // 6) Emit Verilog
     std::ofstream out("port_out.v");
     for (auto &c : src.component_list)
         c.repr(out, subckt_definition_map);
 }
 
-int main() {
+int main(){
     auto T0 = std::chrono::high_resolution_clock::now();
 
-    // pick your example:
-    // test1:
-    // Netlist src("examples/test1.sp", subckt_definition_map);
-    // c1355:
     Netlist src("examples/c1355_net_ser_ft.sp", subckt_definition_map);
     src.parse();
-    Netlist lib("examples/c1355_lib.sp", subckt_definition_map); // test1.lib or c1355.sp
+    Netlist lib("examples/c1355_lib.sp", subckt_definition_map);
     lib.parse();
     src.link();
-
-    // **match smallest first** → puts NAND2 before NAND3
-    lib.standard_sort();
+    lib.standard_reverse_sort();  // still orders lib.component_list
 
     optimized_vf3_hrgen(lib, src);
 
     auto T1 = std::chrono::high_resolution_clock::now();
-    fmt::println("Total end‐to‐end: {:.3f}s",
-        std::chrono::duration<double>(T1 - T0).count() / STRESS_TEST_COUNT);
+    fmt::println("Total end‐to‐end per iter: {:.3f}s",
+      std::chrono::duration<double>(T1 - T0).count()/STRESS_TEST_COUNT);
 
     return 0;
 }
