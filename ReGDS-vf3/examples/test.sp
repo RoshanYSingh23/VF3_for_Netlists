@@ -1,0 +1,4 @@
+.SUBCKT c1 A AN VDD GND
+M1 AN A VDD VDD pmos w=2u l=1u
+M2 AN A GND GND nmos w=1u l=1u
+.ENDS

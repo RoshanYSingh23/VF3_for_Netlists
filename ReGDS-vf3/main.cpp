@@ -258,9 +258,9 @@ void optimized_vf3_hrgen(Netlist& lib, Netlist& src) {
 int main(){
     auto T0 = std::chrono::high_resolution_clock::now();
 
-    Netlist src("examples/c1355_net_ser_ft.sp", subckt_definition_map);
+    Netlist src("examples/test.sp", subckt_definition_map);
     src.parse();
-    Netlist lib("examples/c1355_lib.sp", subckt_definition_map);
+    Netlist lib("examples/lib.sp", subckt_definition_map);
     lib.parse();
     src.link();
     lib.standard_reverse_sort();  // still orders lib.component_list
